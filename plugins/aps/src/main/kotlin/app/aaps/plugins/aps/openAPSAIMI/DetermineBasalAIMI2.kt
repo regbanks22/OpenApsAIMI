@@ -53,6 +53,7 @@ import android.content.Context
 import app.aaps.core.keys.UnitDoubleKey
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.plugins.aps.R
+import app.aaps.plugins.aps.openAPSAIMI.model.LoopContext
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdCsvLogger
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdIntegration
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.PkPdLogRow
@@ -61,34 +62,44 @@ import java.time.temporal.ChronoUnit
 import kotlin.math.ceil
 import kotlin.math.exp
 import app.aaps.plugins.aps.openAPSAIMI.pkpd.SmbDampingAudit
+import kotlin.math.abs
+import kotlin.math.ceil
+import app.aaps.plugins.aps.openAPSAIMI.smb.MealHighIobDecision
+import app.aaps.plugins.aps.openAPSAIMI.smb.SmbDampingUsecase
+import app.aaps.plugins.aps.openAPSAIMI.safety.HighBgOverride
+import app.aaps.plugins.aps.openAPSAIMI.safety.HypoTools
+import app.aaps.plugins.aps.openAPSAIMI.safety.SafetyDecision
+import app.aaps.plugins.aps.openAPSAIMI.basal.BasalHistoryUtils
+import app.aaps.plugins.aps.openAPSAIMI.ports.PkpdPort
+import app.aaps.plugins.aps.openAPSAIMI.smb.SmbQuantizer
 
 
 // 📝 Structure & helper pour partager la logique de relâchement du plafond IOB en mode repas.
-internal data class MealHighIobDecision(val relax: Boolean, val damping: Double)
-
-// 📝 Calcule si l'on peut assouplir le plafond IOB lors d'un repas montant et le facteur de réduction associé.
-internal fun computeMealHighIobDecision(
-    mealModeActive: Boolean,
-    bg: Double,
-    delta: Double,
-    eventualBg: Double,
-    targetBg: Double,
-    iob: Double,
-    maxIob: Double
-): MealHighIobDecision {
-    if (!mealModeActive) return MealHighIobDecision(false, 1.0)
-    if (maxIob <= 0.0) return MealHighIobDecision(false, 1.0)
-    if (iob <= maxIob) return MealHighIobDecision(false, 1.0)
-    if (bg <= max(120.0, targetBg)) return MealHighIobDecision(false, 1.0)
-    if (delta <= 0.5) return MealHighIobDecision(false, 1.0)
-    if (eventualBg <= targetBg + 10.0) return MealHighIobDecision(false, 1.0)
-    val slack = maxIob * 0.3
-    if (slack <= 0.0) return MealHighIobDecision(false, 1.0)
-    if (iob > maxIob + slack) return MealHighIobDecision(false, 1.0)
-    val excessFraction = ((iob - maxIob) / slack).coerceIn(0.0, 1.0)
-    val damping = 1.0 - 0.5 * excessFraction
-    return MealHighIobDecision(true, damping)
-}
+// internal data class MealHighIobDecision(val relax: Boolean, val damping: Double)
+//
+// // 📝 Calcule si l'on peut assouplir le plafond IOB lors d'un repas montant et le facteur de réduction associé.
+// internal fun computeMealHighIobDecision(
+//     mealModeActive: Boolean,
+//     bg: Double,
+//     delta: Double,
+//     eventualBg: Double,
+//     targetBg: Double,
+//     iob: Double,
+//     maxIob: Double
+// ): MealHighIobDecision {
+//     if (!mealModeActive) return MealHighIobDecision(false, 1.0)
+//     if (maxIob <= 0.0) return MealHighIobDecision(false, 1.0)
+//     if (iob <= maxIob) return MealHighIobDecision(false, 1.0)
+//     if (bg <= max(120.0, targetBg)) return MealHighIobDecision(false, 1.0)
+//     if (delta <= 0.5) return MealHighIobDecision(false, 1.0)
+//     if (eventualBg <= targetBg + 10.0) return MealHighIobDecision(false, 1.0)
+//     val slack = maxIob * 0.3
+//     if (slack <= 0.0) return MealHighIobDecision(false, 1.0)
+//     if (iob > maxIob + slack) return MealHighIobDecision(false, 1.0)
+//     val excessFraction = ((iob - maxIob) / slack).coerceIn(0.0, 1.0)
+//     val damping = 1.0 - 0.5 * excessFraction
+//     return MealHighIobDecision(true, damping)
+// }
 
 @Singleton
 class DetermineBasalaimiSMB2 @Inject constructor(
@@ -227,6 +238,143 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val q = (ceil((u / step).toDouble()) * step).toFloat()
         return if (q == 0f && u >= (0.6f * step)) step else q
     }
+    private class PkpdPortAdapter(
+        private val pkpdIntegration: PkPdIntegration
+    ) : PkpdPort {
+
+        override fun snapshot(ctx: LoopContext): PkpdPort.Snapshot {
+            val rt = pkpdIntegration.computeRuntime(
+                epochMillis   = ctx.nowEpochMillis,
+                bg            = ctx.bg.mgdl,
+                deltaMgDlPer5 = ctx.bg.delta5,
+                iobU          = ctx.iobU,
+                carbsActiveG  = ctx.cobG,
+                windowMin     =  ctx.settings.smbIntervalMin, // ou windowSinceDoseInt si tu veux
+                exerciseFlag  = false,                         // si tu as sportTime, remplace ici
+                profileIsf    = ctx.profile.isfMgdlPerU,
+                tdd24h        = ctx.tdd24hU
+            )
+            return if (rt != null) {
+                PkpdPort.Snapshot(
+                    diaMin = (rt.params.diaH * 60.0).toInt(),
+                    peakMin = rt.params.peakMin.toInt(),
+                    fusedIsf = rt.fusedIsf,
+                    tailFrac = rt.tailFraction,
+                    smbProposalU = rt.smbProposalU,
+                    tailMult = rt.tailMult,
+                    exerciseMult = rt.exerciseMult,
+                    lateFatMult = rt.lateFatMult,
+                    lateFatRise = rt.lateFatRise
+                )
+            } else {
+                PkpdPort.Snapshot(diaMin = 6*60, peakMin = 60/3, fusedIsf = ctx.profile.isfMgdlPerU, tailFrac = 0.0)
+            }
+        }
+
+        override fun dampSmb(units: Double, ctx: LoopContext, bypassDamping: Boolean): PkpdPort.DampingAudit {
+            val rt = pkpdIntegration.computeRuntime(
+                epochMillis   = ctx.nowEpochMillis,
+                bg            = ctx.bg.mgdl,
+                deltaMgDlPer5 = ctx.bg.delta5,
+                iobU          = ctx.iobU,
+                carbsActiveG  = ctx.cobG,
+                windowMin     = ctx.settings.smbIntervalMin,
+                exerciseFlag  = false,
+                profileIsf    = ctx.profile.isfMgdlPerU,
+                tdd24h        = ctx.tdd24hU
+            )
+            val audited = rt?.dampSmbWithAudit(
+                smb = units,
+                exercise = false,                      // remplace si tu as le flag
+                suspectedLateFatMeal = (rt?.lateFatRise == true),
+                bypassDamping = bypassDamping          // 🔴 NOUVEAU : bypass du patch
+            )
+            return if (audited != null) {
+                PkpdPort.DampingAudit(
+                    out = audited.out,
+                    tailApplied = audited.tailApplied, tailMult = audited.tailMult,
+                    exerciseApplied = audited.exerciseApplied, exerciseMult = audited.exerciseMult,
+                    lateFatApplied = audited.lateFatApplied, lateFatMult = audited.lateFatMult,
+                    mealBypass = audited.mealBypass
+                )
+            } else {
+                PkpdPort.DampingAudit(units,false,1.0,false,1.0,false,1.0, mealBypass = false)
+            }
+        }
+
+        override fun logCsv(
+            ctx: LoopContext,
+            pkpd: PkpdPort.Snapshot,
+            smbProposed: Double,
+            smbFinal: Double,
+            audit: PkpdPort.DampingAudit?
+        ) {
+            val dateStr  = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(ctx.nowEpochMillis))
+            val epochMin = java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(ctx.nowEpochMillis)
+            PkPdCsvLogger.append(
+                PkPdLogRow(
+                    dateStr = dateStr,
+                    epochMin = epochMin,
+                    bg = ctx.bg.mgdl,
+                    delta5 = ctx.bg.delta5,
+                    iobU = ctx.iobU,
+                    carbsActiveG = ctx.cobG,
+                    windowMin = ctx.settings.smbIntervalMin,
+                    diaH = pkpd.diaMin / 60.0,
+                    peakMin = pkpd.peakMin.toDouble(),
+                    fusedIsf = pkpd.fusedIsf,
+                    tddIsf = 1800.0 / (ctx.tdd24hU.coerceAtLeast(0.1)), // comme avant si tu l’utilises
+                    profileIsf = ctx.profile.isfMgdlPerU,
+                    tailFrac = pkpd.tailFrac,
+                    smbProposedU = smbProposed,
+                    smbFinalU = smbFinal,
+                    tailMult = audit?.tailMult,
+                    exerciseMult = audit?.exerciseMult,
+                    lateFatMult = audit?.lateFatMult,
+                    highBgOverride = null,
+                    lateFatRise = pkpd.lateFatRise,
+                    quantStepU = ctx.pump.bolusStep
+                )
+            )
+        }
+    }
+    private class MlUamPortAdapter(
+        private val context: android.content.Context
+    ) : MlUamPort {
+        override fun predictSmbDelta(ctx: LoopContext): Double {
+            // ⚠️ Construit EXACTEMENT le vecteur actuel :
+            val features = floatArrayOf(
+                ctx.bg.mgdl.toFloat(),
+                ctx.bg.delta5.toFloat(),
+                (ctx.bg.shortAvgDelta ?: 0.0).toFloat(),
+                (ctx.bg.longAvgDelta ?: 0.0).toFloat(),
+                (ctx.bg.accel ?: 0.0).toFloat(),
+                ctx.iobU.toFloat(),
+                ctx.cobG.toFloat(),
+                (ctx.bg.combinedDelta ?: 0.0).toFloat()
+                // ⬅️ Ajoute ici toute autre feature utilisée aujourd’hui, dans le même ordre !
+            )
+            val out = AimiUamHandler.predictSmbUam(features, /*reason*/null, context)
+            return out.toDouble()
+        }
+    }
+    private class SafetyGuardsAdapter(
+        private val hypoThreshold: Double,
+        private val marginFast: Double = 10.0,
+        private val marginFall: Double = 5.0
+    ) : SafetyGuards {
+        override fun apply(ctx: LoopContext, basal: BasalPlan?, smb: SmbPlan?): SafetyReport {
+            val d = ctx.bg.delta5
+            val margin = when {
+                d <= -3.0 -> marginFast
+                d <= -1.5 -> marginFall
+                else -> 0.0
+            }
+            val hypoRisk = (ctx.bg.mgdl <= hypoThreshold + margin) || (ctx.eventualBg <= hypoThreshold + margin)
+            val blocked = hypoRisk && ((smb?.units ?: 0.0) > 0.0)
+            return SafetyReport(hypoBlocked = blocked, notes = emptyList())
+        }
+    }
 
 
     private fun buildNightGrowthResistanceConfig(): NGRConfig {
@@ -337,51 +485,51 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
 
     private fun roundBasal(value: Double): Double = value
-    private fun getZeroBasalDuration(persistenceLayer: PersistenceLayer, lookBackHours: Int): Int {
-        val now = System.currentTimeMillis()
-        val fromTime = now - lookBackHours * 60 * 60 * 1000L
-
-        // Récupère les basales temporaires triées par timestamp décroissant
-        val tempBasals: List<TB> = persistenceLayer
-            .getTemporaryBasalsStartingFromTime(fromTime, ascending = false)
-            .blockingGet()
-
-        if (tempBasals.isEmpty()) {
-            return 0 // Aucune donnée disponible pendant la période de recherche
-        }
-
-        var lastZeroTimestamp = fromTime // Initialiser avec le timestamp de base
-
-        for (event in tempBasals) {
-            if (event.rate > 0.05) break
-            lastZeroTimestamp = event.timestamp
-        }
-
-        // Si aucun événement n'a un taux > 0.05, alors on considère la durée depuis le début de la période
-        val zeroDuration = if (lastZeroTimestamp == fromTime) {
-            now - fromTime
-        } else {
-            now - lastZeroTimestamp
-        }
-
-        return (zeroDuration / 60000L).toInt()
-    }
+    // private fun getZeroBasalDuration(persistenceLayer: PersistenceLayer, lookBackHours: Int): Int {
+    //     val now = System.currentTimeMillis()
+    //     val fromTime = now - lookBackHours * 60 * 60 * 1000L
+    //
+    //     // Récupère les basales temporaires triées par timestamp décroissant
+    //     val tempBasals: List<TB> = persistenceLayer
+    //         .getTemporaryBasalsStartingFromTime(fromTime, ascending = false)
+    //         .blockingGet()
+    //
+    //     if (tempBasals.isEmpty()) {
+    //         return 0 // Aucune donnée disponible pendant la période de recherche
+    //     }
+    //
+    //     var lastZeroTimestamp = fromTime // Initialiser avec le timestamp de base
+    //
+    //     for (event in tempBasals) {
+    //         if (event.rate > 0.05) break
+    //         lastZeroTimestamp = event.timestamp
+    //     }
+    //
+    //     // Si aucun événement n'a un taux > 0.05, alors on considère la durée depuis le début de la période
+    //     val zeroDuration = if (lastZeroTimestamp == fromTime) {
+    //         now - fromTime
+    //     } else {
+    //         now - lastZeroTimestamp
+    //     }
+    //
+    //     return (zeroDuration / 60000L).toInt()
+    // }
     // -- Classe représentant la décision de sécurité --
-    data class SafetyDecision(
-        val stopBasal: Boolean,      // true => arrête la basale (ou force une basale à 0)
-        val bolusFactor: Double,     // Facteur multiplicateur appliqué à la dose SMB (1.0 = dose complète, 0.0 = annulation)
-        val reason: String,           // Log résumant les critères ayant conduit à la décision
-        val basalLS: Boolean
-    )
+    // data class SafetyDecision(
+    //     val stopBasal: Boolean,      // true => arrête la basale (ou force une basale à 0)
+    //     val bolusFactor: Double,     // Facteur multiplicateur appliqué à la dose SMB (1.0 = dose complète, 0.0 = annulation)
+    //     val reason: String,           // Log résumant les critères ayant conduit à la décision
+    //     val basalLS: Boolean
+    // )
 
     // -- Calcul de la chute de BG par heure sur une fenêtre donnée (en minutes) --
-    fun calculateDropPerHour(bgHistory: List<Float>, windowMinutes: Float): Float {
-        if (bgHistory.size < 2) return 0f
-        val first = bgHistory.first()  // plus ancien
-        val last  = bgHistory.last()   // plus récent
-        val drop  = (first - last)     // positif si baisse
-        return drop * (60f / windowMinutes)
-    }
+    // fun calculateDropPerHour(bgHistory: List<Float>, windowMinutes: Float): Float {
+    //     if (bgHistory.size < 2) return 0f
+    //     val first = bgHistory.first()  // plus ancien
+    //     val last  = bgHistory.last()   // plus récent
+    //     val drop  = (first - last)     // positif si baisse
+    //     return drop * (60f / windowMinutes)
+    // }
 
     /**
      * Ajuste la dose d'insuline (SMB) et décide éventuellement de stopper la basale.
@@ -1603,25 +1751,6 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return t
     }
 
-    // Hard safety: vrai si BG, predictedBG ou eventualBG passent sous le seuil
-    // private fun isBelowHypoThreshold(
-    //     bg: Double,
-    //     predictedBg: Double,
-    //     eventualBg: Double,
-    //     threshold: Double,
-    //     deltaMgdlPer5min: Double = 0.0
-    // ): Boolean {
-    //     fun safe(v: Double) = if (v.isFinite()) v else Double.POSITIVE_INFINITY
-    //     val minBg = minOf(safe(bg), safe(predictedBg), safe(eventualBg))
-    //
-    //     val extraMargin = when {
-    //         minBg <= threshold           -> 0.0
-    //         deltaMgdlPer5min <= -3.0     -> HYPO_MARGIN_FAST
-    //         deltaMgdlPer5min <= -1.5     -> HYPO_MARGIN_FALL
-    //         else                         -> HYPO_MARGIN_BASE
-    //     }
-    //     return minBg <= threshold + extraMargin
-    // }
     private fun isBelowHypoThreshold(
         bgNow: Double,
         predicted: Double,
@@ -1974,15 +2103,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         val blendedSMB = alpha * finalRefinedSMB + (1 - alpha) * predictedSMB
         return blendedSMB
     }
-    // private fun computeDynamicBolusMultiplier(delta: Float): Float {
-    //     return when {
-    //         delta > 20f -> 1.2f  // Montée très rapide : augmenter la dose corrective
-    //         delta > 15f -> 1.1f  // Montée rapide
-    //         delta > 10f -> 1.0f  // Montée modérée : pas de réduction
-    //         delta in 5f..10f -> 0.9f // Légère réduction pour des changements moins brusques
-    //         else -> 0.8f // Pour des variations faibles ou des baisses, appliquer une réduction standard
-    //     }
-    // }
+
     private fun computeDynamicBolusMultiplier(delta: Float): Float {
         // Centrer la sigmoïde autour de 5 mg/dL, avec une pente modérée (échelle 10)
         val x = (delta - 5f) / 10f
@@ -2197,73 +2318,73 @@ class DetermineBasalaimiSMB2 @Inject constructor(
         return delayFactor
     }
 
-    fun calculateMinutesAboveThreshold(
-        bg: Double,           // Glycémie actuelle (mg/dL)
-        slope: Double,        // Pente de la glycémie (mg/dL par minute)
-        thresholdBG: Double   // Seuil de glycémie (mg/dL)
-    ): Int {
-        val bgDifference = bg - thresholdBG
+    // fun calculateMinutesAboveThreshold(
+    //     bg: Double,           // Glycémie actuelle (mg/dL)
+    //     slope: Double,        // Pente de la glycémie (mg/dL par minute)
+    //     thresholdBG: Double   // Seuil de glycémie (mg/dL)
+    // ): Int {
+    //     val bgDifference = bg - thresholdBG
+    //
+    //     // Vérifier si la glycémie est en baisse
+    //     if (slope >= 0) {
+    //         // La glycémie est stable ou en hausse, retournez une valeur élevée
+    //         return Int.MAX_VALUE // ou un grand nombre, par exemple 999
+    //     }
+    //
+    //     // Estimer le temps jusqu'au seuil
+    //     val minutesAboveThreshold = bgDifference / -slope
+    //
+    //     // Vérifier que le temps est positif et raisonnable
+    //     return if (minutesAboveThreshold.isFinite() && minutesAboveThreshold > 0) {
+    //         minutesAboveThreshold.roundToInt()
+    //     } else {
+    //         // Retourner une valeur maximale par défaut si le calcul n'est pas valide
+    //         Int.MAX_VALUE
+    //     }
+    // }
 
-        // Vérifier si la glycémie est en baisse
-        if (slope >= 0) {
-            // La glycémie est stable ou en hausse, retournez une valeur élevée
-            return Int.MAX_VALUE // ou un grand nombre, par exemple 999
-        }
 
-        // Estimer le temps jusqu'au seuil
-        val minutesAboveThreshold = bgDifference / -slope
-
-        // Vérifier que le temps est positif et raisonnable
-        return if (minutesAboveThreshold.isFinite() && minutesAboveThreshold > 0) {
-            minutesAboveThreshold.roundToInt()
-        } else {
-            // Retourner une valeur maximale par défaut si le calcul n'est pas valide
-            Int.MAX_VALUE
-        }
-    }
-
-
-    fun estimateRequiredCarbs(
-        bg: Double, // Glycémie actuelle
-        targetBG: Double, // Objectif de glycémie
-        slope: Double, // Vitesse de variation de la glycémie (mg/dL par minute)
-        iob: Double, // Insulin On Board - quantité d'insuline encore active
-        csf: Double, // Facteur de sensibilité aux glucides (mg/dL par gramme de glucides)
-        isf: Double, // Facteur de sensibilité à l'insuline (mg/dL par unité d'insuline)
-        cob: Double // Carbs On Board - glucides en cours d'absorption
-    ): Int {
-        // 1. Calculer la projection de la glycémie future basée sur la pente actuelle et le temps (30 minutes)
-        val timeAhead = 20.0 // Projection sur 30 minutes
-        val projectedDrop = slope * timeAhead // Estimation de la chute future de la glycémie
-
-        // 2. Estimer l'effet de l'insuline active restante (IOB) sur la glycémie
-        val insulinEffect = iob * isf // L'effet de l'insuline résiduelle
-
-        // 3. Effet total estimé : baisse de la glycémie + effet de l'insuline
-        val totalPredictedDrop = projectedDrop + insulinEffect
-
-        // 4. Calculer la glycémie future estimée sans intervention
-        val futureBG = bg - totalPredictedDrop
-
-        // 5. Si la glycémie projetée est inférieure à la cible, estimer les glucides nécessaires
-        if (futureBG < targetBG) {
-            val bgDifference = targetBG - futureBG
-
-            // 6. Si des glucides sont en cours d'absorption (COB), les prendre en compte
-            val netCarbImpact = max(0.0, bgDifference - (cob * csf)) // Ajuster avec COB
-
-            // 7. Calculer les glucides nécessaires pour combler la différence de glycémie
-            val carbsReq = round(netCarbImpact / csf)
-
-            // Debug info
-            //consoleError.add("Future BG: $futureBG, Projected Drop: $projectedDrop, Insulin Effect: $insulinEffect, COB Impact: ${cob * csf}, Carbs Required: $carbsReq")
-            consoleError.add(context.getString(R.string.console_future_bg, "%.0f".format(futureBG), "%.0f".format(projectedDrop), "%.0f".format(insulinEffect), (cob * csf), carbsReq))
-
-            return carbsReq
-        }
-
-        return 0 // Aucun glucide nécessaire si la glycémie future est au-dessus de la cible
-    }
+    // fun estimateRequiredCarbs(
+    //     bg: Double, // Glycémie actuelle
+    //     targetBG: Double, // Objectif de glycémie
+    //     slope: Double, // Vitesse de variation de la glycémie (mg/dL par minute)
+    //     iob: Double, // Insulin On Board - quantité d'insuline encore active
+    //     csf: Double, // Facteur de sensibilité aux glucides (mg/dL par gramme de glucides)
+    //     isf: Double, // Facteur de sensibilité à l'insuline (mg/dL par unité d'insuline)
+    //     cob: Double // Carbs On Board - glucides en cours d'absorption
+    // ): Int {
+    //     // 1. Calculer la projection de la glycémie future basée sur la pente actuelle et le temps (30 minutes)
+    //     val timeAhead = 20.0 // Projection sur 30 minutes
+    //     val projectedDrop = slope * timeAhead // Estimation de la chute future de la glycémie
+    //
+    //     // 2. Estimer l'effet de l'insuline active restante (IOB) sur la glycémie
+    //     val insulinEffect = iob * isf // L'effet de l'insuline résiduelle
+    //
+    //     // 3. Effet total estimé : baisse de la glycémie + effet de l'insuline
+    //     val totalPredictedDrop = projectedDrop + insulinEffect
+    //
+    //     // 4. Calculer la glycémie future estimée sans intervention
+    //     val futureBG = bg - totalPredictedDrop
+    //
+    //     // 5. Si la glycémie projetée est inférieure à la cible, estimer les glucides nécessaires
+    //     if (futureBG < targetBG) {
+    //         val bgDifference = targetBG - futureBG
+    //
+    //         // 6. Si des glucides sont en cours d'absorption (COB), les prendre en compte
+    //         val netCarbImpact = max(0.0, bgDifference - (cob * csf)) // Ajuster avec COB
+    //
+    //         // 7. Calculer les glucides nécessaires pour combler la différence de glycémie
+    //         val carbsReq = round(netCarbImpact / csf)
+    //
+    //         // Debug info
+    //         //consoleError.add("Future BG: $futureBG, Projected Drop: $projectedDrop, Insulin Effect: $insulinEffect, COB Impact: ${cob * csf}, Carbs Required: $carbsReq")
+    //         consoleError.add(context.getString(R.string.console_future_bg, "%.0f".format(futureBG), "%.0f".format(projectedDrop), "%.0f".format(insulinEffect), (cob * csf), carbsReq))
+    //
+    //         return carbsReq
+    //     }
+    //
+    //     return 0 // Aucun glucide nécessaire si la glycémie future est au-dessus de la cible
+    // }
 
     private fun calculateInsulinEffect(
         bg: Float,
@@ -3927,52 +4048,52 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         val mealModeRun = (mealTime || bfastTime || lunchTime || dinnerTime || highCarbTime)
 
-// heuristique hyper hors repas — ajuste si besoin
-        val highBgRiseActive =
-            (bg >= 150.0 && (delta >= 1.5 || combinedDelta >= 4.0)) &&
-                (iob < maxSMB) &&
-                !isBelowHypoThreshold(
-                    bgNow = bg,
-                    predicted = predictedBg.toDouble(),
-                    eventual = eventualBG,
-                    hypo = hypoGuard,
-                    delta = delta.toDouble()
-                )
+        val highBgRiseActive = (bg >= 150.0 && (delta >= 1.5 || combinedDelta >= 4.0)) && (iob < maxSMB) &&
+            !isBelowHypoThreshold(
+                bgNow = bg, predicted = predictedBg.toDouble(), eventual = eventualBG,
+                hypo = hypoGuard, delta = delta.toDouble()
+            )
 
-        val bypassDamping = mealModeRun || highBgRiseActive
-
-        val audit: SmbDampingAudit? = pkpdRuntime?.dampSmbWithAudit(
-            smb = smbDecision.toDouble(),
-            exercise = exFlag,
-            suspectedLateFatMeal = lateFatFlag,
-            bypassDamping = bypassDamping
+        val dampingOut = SmbDampingUsecase.run(
+            pkpdRuntime,
+            SmbDampingUsecase.Input(
+                smbDecision = smbDecision.toDouble(),
+                exercise = exFlag,
+                suspectedLateFatMeal = lateFatFlag,
+                mealModeRun = mealModeRun,
+                highBgRiseActive = highBgRiseActive
+            )
         )
+        var smbAfterDamping = dampingOut.smbAfterDamping
+        val audit = dampingOut.audit
 
-        var smbAfterDamping: Double = audit?.out ?: smbDecision.toDouble()
 
 
 // ---- Override “haut BG sans risque d’hypo” (agressif mais safe) ----
-        val highBgOverride =
-            (bg >= 180.0 || (bg >= 150.0 && delta >= 1.5)) &&
-                !isBelowHypoThreshold(
-                    bgNow = bg,
-                    predicted = predictedBg.toDouble(),
-                    eventual = eventualBG,
-                    hypo = hypoGuard,
-                    delta = delta.toDouble()
-                ) &&
-                iob < maxSMB
-
-        if (highBgOverride) {
-            this.intervalsmb = 0 // cadence agressive
-            val stepD = INSULIN_STEP.toDouble()
-            if (smbAfterDamping < stepD) smbAfterDamping = stepD
-            smbAfterDamping = min(smbAfterDamping, maxSMB.toDouble())
-            highBgOverrideUsed = true
+        HighBgOverride.apply(
+            bg = bg,
+            delta = delta.toDouble(),
+            predictedBg = predictedBg.toDouble(),
+            eventualBg = eventualBG,
+            hypoGuard = hypoGuard,
+            iob = iob.toDouble(),
+            maxSmb = maxSMB.toDouble(),
+            currentDose = smbAfterDamping,
+            pumpStep = INSULIN_STEP.toDouble()
+        ).also { res ->
+            smbAfterDamping = res.dose
+            if (res.overrideUsed) {
+                highBgOverrideUsed = true
+                res.newInterval?.let { this.intervalsmb = it }
+            }
         }
 
+
 // ---- Quantification pompe (respecte la signature Float, Float) ----
-        val finalSmb: Float = quantizeToPumpStep(smbAfterDamping.toFloat(), INSULIN_STEP)
+        val finalSmb: Float = SmbQuantizer.quantizeToPumpStep(
+            smbAfterDamping.toFloat(),
+            INSULIN_STEP
+        )
         smbToGive = finalSmb
 
 // Pour le log info « quantized » (Double)
