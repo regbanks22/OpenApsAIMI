@@ -242,51 +242,46 @@ class DetermineBasalaimiSMB2 @Inject constructor(
 
         override fun snapshot(ctx: LoopContext): PkpdPort.Snapshot {
             val rt = pkpdIntegration.computeRuntime(
-                epochMillis   = ctx.nowEpochMillis,
-                bg            = ctx.bg.mgdl,
+                epochMillis = ctx.nowEpochMillis,
+                bg = ctx.bg.mgdl,
                 deltaMgDlPer5 = ctx.bg.delta5,
-                iobU          = ctx.iobU,
-                carbsActiveG  = ctx.cobG,
-                windowMin     =  ctx.settings.smbIntervalMin, // ou windowSinceDoseInt si tu veux
-                exerciseFlag  = false,                         // si tu as sportTime, remplace ici
-                profileIsf    = ctx.profile.isfMgdlPerU,
-                tdd24h        = ctx.tdd24hU
+                iobU = ctx.iobU,
+                carbsActiveG = ctx.cobG,
+                windowMin = ctx.settings.smbIntervalMin,
+                exerciseFlag = false, // remplace par ctx.modes.sport si dispo
+                profileIsf = ctx.profile.isfMgdlPerU,
+                tdd24h = ctx.tdd24hU
             )
             return if (rt != null) {
                 PkpdPort.Snapshot(
-                    diaMin = (rt.params.diaH * 60.0).toInt(),
-                    peakMin = rt.params.peakMin.toInt(),
+                    diaMin   = (rt.params.diaHrs * 60.0).toInt(), // ✅ diaHrs
+                    peakMin  = rt.params.peakMin.toInt(),
                     fusedIsf = rt.fusedIsf,
-                    tailFrac = rt.tailFraction,
-                    smbProposalU = rt.smbProposalU,
-                    tailMult = rt.tailMult,
-                    exerciseMult = rt.exerciseMult,
-                    lateFatMult = rt.lateFatMult,
-                    lateFatRise = rt.lateFatRise
+                    tailFrac = rt.tailFraction
+                    // ⚠ champs SMB optionnels laissent null ici
                 )
             } else {
-                PkpdPort.Snapshot(diaMin = 6*60, peakMin = 60/3, fusedIsf = ctx.profile.isfMgdlPerU, tailFrac = 0.0)
+                PkpdPort.Snapshot(diaMin = 6*60, peakMin = 60, fusedIsf = ctx.profile.isfMgdlPerU, tailFrac = 0.0)
             }
         }
 
         override fun dampSmb(units: Double, ctx: LoopContext, bypassDamping: Boolean): PkpdPort.DampingAudit {
-            val rt = pkpdIntegration.computeRuntime(
-                epochMillis   = ctx.nowEpochMillis,
-                bg            = ctx.bg.mgdl,
-                deltaMgDlPer5 = ctx.bg.delta5,
-                iobU          = ctx.iobU,
-                carbsActiveG  = ctx.cobG,
-                windowMin     = ctx.settings.smbIntervalMin,
-                exerciseFlag  = false,
-                profileIsf    = ctx.profile.isfMgdlPerU,
-                tdd24h        = ctx.tdd24hU
-            )
+            val rt = pkpdIntegration.computeRuntime(epochMillis = ctx.nowEpochMillis,
+                                                    bg = ctx.bg.mgdl,
+                                                    deltaMgDlPer5 = ctx.bg.delta5,
+                                                    iobU = ctx.iobU,
+                                                    carbsActiveG = ctx.cobG,
+                                                    windowMin = ctx.settings.smbIntervalMin,
+                                                    exerciseFlag = false, // remplace par ctx.modes.sport si dispo
+                                                    profileIsf = ctx.profile.isfMgdlPerU,
+                                                    tdd24h = ctx.tdd24hU)
+
             val damping = SmbDampingUsecase.run(
                 rt,
                 SmbDampingUsecase.Input(
                     smbDecision = units,
-                    exercise = false,
-                    suspectedLateFatMeal = (rt?.lateFatRise == true),
+                    exercise = false, // adapte si tu as un flag d’exercice
+                    suspectedLateFatMeal = ctx.modes.highCarb, // ✅ depuis les modes
                     mealModeRun = bypassDamping,
                     highBgRiseActive = false
                 )
@@ -304,6 +299,7 @@ class DetermineBasalaimiSMB2 @Inject constructor(
                 PkpdPort.DampingAudit(damping.smbAfterDamping, false, 1.0, false, 1.0, false, 1.0, mealBypass = false)
             }
         }
+
 
         override fun logCsv(
             ctx: LoopContext,

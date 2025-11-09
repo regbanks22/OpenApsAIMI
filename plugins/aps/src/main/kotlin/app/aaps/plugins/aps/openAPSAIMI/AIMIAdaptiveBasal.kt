@@ -139,4 +139,39 @@ class AIMIAdaptiveBasal @Inject constructor(
         runCatching { this.get(key) }.getOrNull() ?: default
     private fun Preferences.getOr(key: BooleanKey, default: Boolean) =
         runCatching { this.get(key) }.getOrNull() ?: default
+    companion object {
+        /**
+         * Entrée statique pratique pour les appels existants (BasalPlanner, etc.).
+         * Délègue à une instance AIMIAdaptiveBasal() sans DI.
+         *
+         * Si tu veux garder l'injection (prefs/log/fmt),
+         * appelle plutôt l'instance injectée : injectedAimiAdaptiveBasal.suggest(input)
+         */
+        fun suggest(input: Input): Decision {
+            // Version “fallback” sans DI, pratique pour tests/outillage.
+            // Si DecimalFormatter/AAPSLogger/Preferences doivent venir de DI,
+            // crée plutôt (ou injecte) une instance et appelle instance.suggest(input).
+            val dummyPrefs = object : Preferences {}
+            val dummyLogger = object : AAPSLogger {
+                override fun debug(tag: LTag, msg: String) {}
+                override fun info(tag: LTag, msg: String) {}
+                override fun warn(tag: LTag, msg: String) {}
+                override fun error(tag: LTag, msg: String) {}
+                override fun error(tag: LTag, msg: String, tr: Throwable?) {}
+            }
+            val dummyFmt = object : DecimalFormatter {
+                override fun to0Decimal(value: Double) = String.format(java.util.Locale.US, "%.0f", value)
+                override fun to1Decimal(value: Double) = String.format(java.util.Locale.US, "%.1f", value)
+                override fun to2Decimal(value: Double) = String.format(java.util.Locale.US, "%.2f", value)
+                override fun to3Decimal(value: Double) = String.format(java.util.Locale.US, "%.3f", value)
+            }
+
+            return AIMIAdaptiveBasal(
+                prefs = dummyPrefs,
+                log = dummyLogger,
+                fmt = dummyFmt
+            ).suggest(input)
+        }
+    }
+
 }

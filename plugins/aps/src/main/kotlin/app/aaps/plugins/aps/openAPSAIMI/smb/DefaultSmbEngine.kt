@@ -3,6 +3,7 @@ package app.aaps.plugins.aps.openAPSAIMI.smb
 import app.aaps.plugins.aps.openAPSAIMI.model.LoopContext
 import app.aaps.plugins.aps.openAPSAIMI.ports.MlUamPort
 import app.aaps.plugins.aps.openAPSAIMI.ports.PkpdPort
+import app.aaps.plugins.aps.openAPSAIMI.smb.computeMealHighIobDecision
 import kotlin.math.max
 import kotlin.math.min
 
@@ -25,7 +26,7 @@ class DefaultSmbEngine(
         // Relax repas (inchangé)
         val mealActive = ctx.modes.meal || ctx.modes.breakfast || ctx.modes.lunch || ctx.modes.dinner || ctx.modes.highCarb || ctx.modes.snack
         if (mealActive) {
-            val meal = MealHighIobPolicy.compute(
+            val meal = computeMealHighIobDecision(
                 mealModeActive = true,
                 bg = ctx.bg.mgdl,
                 delta = ctx.bg.delta5,
